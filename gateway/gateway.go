@@ -171,11 +171,12 @@ type gatewayImpl struct {
 	eventHandlerFunc EventHandlerFunc
 	token            string
 
-	conn            transport
-	connMu          sync.Mutex
-	heartbeatCancel context.CancelFunc
-	status          Status
-	statusMu        sync.Mutex
+	conn             transport
+	connMu           sync.Mutex
+	heartbeatCancel  context.CancelFunc
+	reconnectCancel  context.CancelFunc
+	status           Status
+	statusMu         sync.Mutex
 
 	heartbeatInterval     time.Duration
 	lastHeartbeatSent     time.Time
@@ -321,6 +322,14 @@ func (g *gatewayImpl) CloseWithCode(ctx context.Context, code int, message strin
 
 	g.connMu.Lock()
 	defer g.connMu.Unlock()
+
+	if code == websocket.CloseNormalClosure || code == websocket.CloseGoingAway {
+		if g.reconnectCancel != nil {
+			g.config.Logger.DebugContext(ctx, "cancelling reconnect goroutine")
+			g.reconnectCancel()
+			g.reconnectCancel = nil
+		}
+	}
 	if g.conn != nil {
 		g.config.RateLimiter.Close(ctx)
 		g.config.Logger.DebugContext(ctx, "closing gateway connection", slog.Int("code", code), slog.String("message", message))
@@ -435,7 +444,16 @@ func (g *gatewayImpl) doReconnect(ctx context.Context) error {
 }
 
 func (g *gatewayImpl) reconnect() {
-	if err := g.doReconnect(context.Background()); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	g.connMu.Lock()
+	g.reconnectCancel = cancel
+	g.connMu.Unlock()
+
+	if err := g.doReconnect(ctx); err != nil {
+		if errors.Is(err, context.Canceled) {
+			g.config.Logger.Debug("reconnect cancelled")
+			return
+		}
 		g.config.Logger.Error("failed to reopen gateway", slog.Any("err", err))
 
 		if g.config.CloseHandler != nil {
